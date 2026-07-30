@@ -1436,6 +1436,8 @@ const runtimeHosts = `127.0.0.1 localhost
 ::1 localhost ip6-localhost ip6-loopback
 `
 
+const runtimeTmpSentinel = ".akernel-keep-rootfs"
+
 func prepareRuntimeDefaultsLowerDir(mountRoot string) (string, error) {
 	lowerDir := filepath.Join(mountRoot, "runtime-defaults")
 	etcDir := filepath.Join(lowerDir, "etc")
@@ -1444,6 +1446,20 @@ func prepareRuntimeDefaultsLowerDir(mountRoot string) (string, error) {
 	}
 	if err := os.WriteFile(filepath.Join(etcDir, "hosts"), []byte(runtimeHosts), 0644); err != nil {
 		return "", fmt.Errorf("failed to write OCI runtime hosts file: %w", err)
+	}
+
+	// runsc mounts an internal tmpfs over an empty /tmp. Keep the directory
+	// non-empty so /tmp remains part of the writable root overlay, matching OCI
+	// runtimes where rename(2) between the image filesystem and /tmp is atomic.
+	tmpDir := filepath.Join(lowerDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0777|os.ModeSticky); err != nil {
+		return "", fmt.Errorf("failed to create OCI runtime tmp directory: %w", err)
+	}
+	if err := os.Chmod(tmpDir, 0777|os.ModeSticky); err != nil {
+		return "", fmt.Errorf("failed to set OCI runtime tmp permissions: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, runtimeTmpSentinel), nil, 0644); err != nil {
+		return "", fmt.Errorf("failed to write OCI runtime tmp sentinel: %w", err)
 	}
 	return lowerDir, nil
 }

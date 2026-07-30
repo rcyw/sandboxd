@@ -1667,6 +1667,17 @@ func TestPrepareRuntimeDefaultsLowerDir(t *testing.T) {
 	if string(data) != runtimeHosts {
 		t.Fatalf("hosts content = %q", data)
 	}
+	tmpDir := filepath.Join(lowerDir, "tmp")
+	tmpInfo, err := os.Stat(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tmpInfo.Mode().Perm(); got != 0777 || tmpInfo.Mode()&os.ModeSticky == 0 {
+		t.Fatalf("tmp mode = %v, want 01777", tmpInfo.Mode())
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, runtimeTmpSentinel)); err != nil {
+		t.Fatalf("runtime tmp sentinel: %v", err)
+	}
 }
 
 func assertSameKeySerializes(t *testing.T, acquire func(string) func(), key string) {
