@@ -86,6 +86,8 @@ type sandboxService struct {
 	fsMgr *fsManager
 
 	ready atomic.Bool
+
+	runscHostCgroupMemoryOverhead int64
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -182,7 +184,14 @@ func (h *sandboxService) startSandboxRuntime(
 		if h.cgroupMgr == nil {
 			return errors.New("cgroup manager is not configured")
 		}
-		hostResources := svc.HostCgroupResources(runtimeName, startConfig.Resources)
+		hostResources, resourceErr := svc.HostCgroupResources(
+			runtimeName,
+			startConfig.Resources,
+			h.runscHostCgroupMemoryOverhead,
+		)
+		if resourceErr != nil {
+			return fmt.Errorf("prepare host cgroup resources: %w", resourceErr)
+		}
 		if err = h.cgroupMgr.Prepare(startConfig.CgroupPath, hostResources); err != nil {
 			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
 		}
@@ -513,6 +522,19 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	} else if err := toml.NewDecoder(bytes.NewReader(configBytes)).Decode(&cfg); err != nil {
 		return nil, err
 	}
+	runscHostCgroupMemoryOverhead, err := config.ParseMemorySize(
+		cfg.RuntimeConfig.RunscHostCgroupMemoryOverhead,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"runtime configuration: parse runsc_host_cgroup_memory_overhead %q: %w",
+			cfg.RuntimeConfig.RunscHostCgroupMemoryOverhead,
+			err,
+		)
+	}
+	if runscHostCgroupMemoryOverhead < 0 {
+		return nil, fmt.Errorf("runtime configuration: runsc_host_cgroup_memory_overhead must not be negative")
+	}
 
 	natBackend, err := resolveNATBackend(cfg.NatBackend)
 	if err != nil {
@@ -597,6 +619,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		fsMgr:                             newFSManager(imgSvc, stateStore),
 		imageMod:                          imgMod,
 		resourceMod:                       nodeResMod,
+		runscHostCgroupMemoryOverhead:     runscHostCgroupMemoryOverhead,
 	}
 
 	// VolumeManager comes up before runtime handlers. Failure to mount XFS is

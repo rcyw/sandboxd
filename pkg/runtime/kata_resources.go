@@ -17,6 +17,7 @@ package runtime
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,16 +46,29 @@ func kataHostResources(
 }
 
 // HostCgroupResources maps sandbox resources to the host cgroup enclosing a
-// runtime. Kata keeps CPU quota/period inside its VM topology, while runsc uses
-// the request unchanged.
+// runtime. Kata keeps CPU quota/period inside its VM topology. Runsc can add
+// host-only memory headroom without changing the guest-visible resource.
 func HostCgroupResources(
 	runtimeName string,
 	resource *runtime.LinuxSandboxResources,
-) *runtime.LinuxSandboxResources {
+	runscMemoryOverhead int64,
+) (*runtime.LinuxSandboxResources, error) {
 	if runtimeName == config.RuntimeNameKata {
-		return kataHostResources(resource)
+		return kataHostResources(resource), nil
 	}
-	return resource
+	if runtimeName != config.RuntimeNameRunsc || resource == nil ||
+		resource.MemoryLimitInBytes <= 0 || runscMemoryOverhead == 0 {
+		return resource, nil
+	}
+	if runscMemoryOverhead < 0 {
+		return nil, fmt.Errorf("runsc host cgroup memory overhead must not be negative")
+	}
+	if resource.MemoryLimitInBytes > math.MaxInt64-runscMemoryOverhead {
+		return nil, fmt.Errorf("runsc host cgroup memory limit overflows int64")
+	}
+	result := proto.Clone(resource).(*runtime.LinuxSandboxResources)
+	result.MemoryLimitInBytes += runscMemoryOverhead
+	return result, nil
 }
 
 // prepareKataResourceSpec gives the VM an explicit topology while keeping the
