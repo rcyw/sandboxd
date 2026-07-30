@@ -402,7 +402,14 @@ func (m *Manager) MountImageWithContext(ctx context.Context, imageURL string) (m
 	reservedChainIDs = append(reservedChainIDs, chainIDs...)
 
 	lowerDirs := reverseCopy(chainPaths)
-	mountPath = filepath.Join(m.mountsDir, mountID, "merged")
+	mountRoot := filepath.Join(m.mountsDir, mountID)
+	runtimeDefaults, err := prepareRuntimeDefaultsLowerDir(mountRoot)
+	if err != nil {
+		timing.RecordError(err)
+		return "", nil, err
+	}
+	lowerDirs = append([]string{runtimeDefaults}, lowerDirs...)
+	mountPath = filepath.Join(mountRoot, "merged")
 	txn = &OciMountTxnRecord{
 		ImageURL:      imageURL,
 		MountID:       mountID,
@@ -1423,6 +1430,22 @@ func reverseCopy(items []string) []string {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out
+}
+
+const runtimeHosts = `127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
+`
+
+func prepareRuntimeDefaultsLowerDir(mountRoot string) (string, error) {
+	lowerDir := filepath.Join(mountRoot, "runtime-defaults")
+	etcDir := filepath.Join(lowerDir, "etc")
+	if err := os.MkdirAll(etcDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create OCI runtime defaults directory: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(etcDir, "hosts"), []byte(runtimeHosts), 0644); err != nil {
+		return "", fmt.Errorf("failed to write OCI runtime hosts file: %w", err)
+	}
+	return lowerDir, nil
 }
 
 func defaultOverlayMount(target string, lowerDirs []string) error {

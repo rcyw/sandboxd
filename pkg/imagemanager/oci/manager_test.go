@@ -1650,6 +1650,25 @@ func TestBuildOverlayMountData(t *testing.T) {
 	}
 }
 
+func TestPrepareRuntimeDefaultsLowerDir(t *testing.T) {
+	mountRoot := filepath.Join(t.TempDir(), "mount")
+
+	lowerDir, err := prepareRuntimeDefaultsLowerDir(mountRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lowerDir != filepath.Join(mountRoot, "runtime-defaults") {
+		t.Fatalf("lower dir = %q", lowerDir)
+	}
+	data, err := os.ReadFile(filepath.Join(lowerDir, "etc", "hosts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != runtimeHosts {
+		t.Fatalf("hosts content = %q", data)
+	}
+}
+
 func assertSameKeySerializes(t *testing.T, acquire func(string) func(), key string) {
 	t.Helper()
 
