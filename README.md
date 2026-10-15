@@ -88,6 +88,8 @@ reserved namespace.
 
 Sandboxd records the Linux boot ID alongside its metadata. A service restart in the same boot preserves active cgroup and TAP leases; missing or replaced active TAP devices still fail startup. When the boot ID changes, only the previous kernel's persisted cgroup and network lease caches are retired. Sandbox metadata, image-manager state, and checkpoint files remain available for normal reconciliation. An unstamped legacy store is adopted without discarding leases because a missing stamp does not prove a host reboot. This allows a worker's Pod to retain its identity across a reboot without treating vanished kernel resources as live; it does not restore sandbox processes or select a checkpoint automatically.
 
+Before accepting RPCs, startup recovery also asks runsc to delete untracked records that explicitly report stopped with no positive process ID. This covers crashes that leave runtime state but no readable sandbox metadata. It uses the runtime's deletion boundary, preserves tracked records and live or ambiguous states, and fails startup on runtime inspection or cleanup errors. Other runtime adapters are unchanged.
+
 An optional per-sandbox ACL uses native netfilter and ipset with the `iptables`
 backend and TC eBPF with the `bpfnat` backend. Both support prioritized
 stateful IPv4 CIDR, domain, protocol, and port rules, fragments, and managed
