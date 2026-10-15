@@ -965,12 +965,25 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
 	bindings := make(map[string]networkacl.Binding)
+	var stoppedRunsc map[string]bool
 	for _, current := range h.sandboxManager.List() {
 		if current == nil || current.Metadata == nil {
 			continue
 		}
 		if current.Metadata.RuntimeHandler == config.RuntimeNameRunc {
 			continue
+		}
+		if current.Metadata.RuntimeHandler == config.RuntimeNameRunsc {
+			if stoppedRunsc == nil {
+				var err error
+				stoppedRunsc, err = h.stoppedRunscForACLRecovery()
+				if err != nil {
+					return nil, err
+				}
+			}
+			if stoppedRunsc[current.Metadata.ID] {
+				continue
+			}
 		}
 		sandboxID := current.Metadata.ID
 		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
