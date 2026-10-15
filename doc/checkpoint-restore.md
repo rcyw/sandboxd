@@ -402,6 +402,12 @@ Incremental checkpoint scheduling (which generations a caller takes and when),
 deterministic replay, migration orchestration, and automatic recovery of a
 source after checkpoint failure are outside this design.
 
+### Host reboot and service restart
+
+Sandboxd uses the Linux boot ID to distinguish a host reboot from a service restart in the same Pod. A changed boot ID retires the old kernel's cgroup and TAP lease caches before resource managers start. It preserves sandbox metadata, image-manager state, and checkpoint files for normal reconciliation; it does not resume processes, select a checkpoint, or guarantee that node-local files survive disk loss. Callers still orchestrate restore and satisfy the runtime and storage compatibility requirements above.
+
+During the same boot, persisted leases remain authoritative and active TAP recovery continues to fail if a device is missing or has been replaced. An unstamped legacy store is adopted without clearing its leases. Unreadable boot identity, invalid persisted identity, or an unreadable lease database fails startup rather than deleting authoritative sandbox state.
+
 ## Writable block I/O policy
 
 New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cache_type = "Writeback"` in `plugin.runtime.firecracker`. The pinned Firecracker runtime bundle includes direct-I/O alignment support. Operators using an older VMM must explicitly select `Async` or `Sync`. The writable policy applies to the private ext4 disk, including native writable mounts. It does not change EROFS root disks, virtio-fs exports, or checkpoint memory-file I/O.

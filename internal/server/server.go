@@ -717,6 +717,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err := resetStateIfPodChanged(cfg.StoreDir, cfg.RootDir, cfg.ImageManagerRoot); err != nil {
 		return nil, fmt.Errorf("reset state on pod change: %w", err)
 	}
+	if err := reconcileHostBoot(cfg.StoreDir); err != nil {
+		return nil, fmt.Errorf("reconcile host boot: %w", err)
+	}
 	storePath := filepath.Join(cfg.StoreDir, "metadata.db")
 	if err := resetMetadataIfResourceStateIncompatible(storePath); err != nil {
 		return nil, fmt.Errorf("reset incompatible metadata: %w", err)
