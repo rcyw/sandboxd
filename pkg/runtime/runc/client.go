@@ -43,6 +43,16 @@ type Client struct {
 	root   string
 }
 
+// commandError carries diagnostics from a runtime which actually exited.
+// Launch failures, interrupted commands and local cleanup errors cannot
+// establish whether a container exists.
+type commandError struct {
+	error
+	diagnostic string
+}
+
+func (e *commandError) Unwrap() error { return e.error }
+
 func NewClient(binary, root string) *Client {
 	return &Client{binary: binary, root: root}
 }
@@ -65,10 +75,18 @@ func (c *Client) command(ctx context.Context, args ...string) ([]byte, error) {
 	if output := strings.TrimSpace(stderr.String()); output != "" {
 		details = append(details, output)
 	}
-	if len(details) == 0 {
-		return stdout.Bytes(), err
+	failure := err
+	if len(details) > 0 {
+		failure = fmt.Errorf("%w: %s", err, strings.Join(details, "\n"))
 	}
-	return stdout.Bytes(), fmt.Errorf("%w: %s", err, strings.Join(details, "\n"))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return stdout.Bytes(), errors.Join(ctxErr, failure)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() >= 0 {
+		return stdout.Bytes(), &commandError{failure, strings.ToLower(stderr.String())}
+	}
+	return stdout.Bytes(), failure
 }
 
 func (c *Client) List(ctx context.Context) ([]State, error) {
@@ -119,8 +137,7 @@ func (c *Client) Delete(ctx context.Context, id string, force bool) error {
 	}
 	args = append(args, id)
 	_, err = c.command(ctx, args...)
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || !IsNotFound(err) {
+	if !IsNotFound(err) {
 		return err
 	}
 	// A failed runc run can create its directory before writing state.json.
@@ -143,27 +160,22 @@ func (c *Client) Delete(ctx context.Context, id string, force bool) error {
 	return nil
 }
 
-// IsNotFound reports the stable class of errors produced for missing state.
+// IsNotFound reports a container-absence diagnostic from an exited runtime.
 func IsNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "does not exist") ||
-		strings.Contains(message, "not found") ||
-		strings.Contains(message, "no such file")
+	var failure *commandError
+	return errors.As(err, &failure) && strings.Contains(failure.diagnostic, "container does not exist")
 }
 
 // IsNotRunning reports errors that are safe when converging a delete.
 func IsNotRunning(err error) bool {
-	if err == nil {
+	var failure *commandError
+	if !errors.As(err, &failure) {
 		return false
 	}
-	message := strings.ToLower(err.Error())
 	return IsNotFound(err) ||
-		strings.Contains(message, "not running") ||
-		strings.Contains(message, "container is stopped") ||
-		strings.Contains(message, "container not running")
+		strings.Contains(failure.diagnostic, "container is not running") ||
+		strings.Contains(failure.diagnostic, "container is stopped") ||
+		strings.Contains(failure.diagnostic, "container not running")
 }
 
 // IgnoreMissing turns idempotent absence into success.

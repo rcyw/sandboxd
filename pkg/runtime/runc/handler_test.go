@@ -16,9 +16,11 @@ package runc
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -200,4 +202,90 @@ func (f *fakeRuncClient) Kill(context.Context, string, string, bool) error {
 
 func (f *fakeRuncClient) Delete(context.Context, string, bool) error {
 	return f.deleteErr
+}
+
+func TestRuncDeleteRetainsFilesUntilRuntimeDeletionSucceeds(t *testing.T) {
+	for _, failure := range []string{"missing-binary", "permission-denied", "runtime-error"} {
+		t.Run(failure, func(t *testing.T) {
+			const id = "sbox-delete-retry"
+			handler := &Handler{sandboxRoot: t.TempDir(), storageRoot: t.TempDir()}
+			binary := filepath.Join(t.TempDir(), "runc")
+			switch failure {
+			case "permission-denied":
+				require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0600))
+			case "runtime-error":
+				require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'helper not found' >&2\nexit 1\n"), 0755))
+			}
+			stateRoot := t.TempDir()
+			statePath := filepath.Join(stateRoot, id)
+			require.NoError(t, os.Mkdir(statePath, 0700))
+			handler.client = NewClient(binary, stateRoot)
+			bundle := filepath.Join(handler.sandboxRoot, id)
+			files := []string{
+				filepath.Join(bundle, runcRootfsDir, "retained"),
+				filepath.Join(bundle, runcEROFSMountsDir, "0", runcEROFSContentDir, "retained"),
+				filepath.Join(handler.storageRoot, id, "upper", "retained"),
+			}
+			for _, path := range files {
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+				require.NoError(t, os.WriteFile(path, []byte("owned data"), 0600))
+			}
+			unmounts := 0
+			originalUnmount := unmountRuncPath
+			t.Cleanup(func() { unmountRuncPath = originalUnmount })
+			unmountRuncPath = func(string) error { unmounts++; return nil }
+
+			err := handler.Delete(context.Background(), id)
+			require.Error(t, err)
+			assert.Zero(t, unmounts, "failed runtime deletion must not tear down its mounts")
+			assert.DirExists(t, statePath)
+			for _, path := range files {
+				assert.FileExists(t, path)
+			}
+
+			// Restore a runtime which confirms this container is absent, then
+			// retry through the same production Handler and Client.
+			require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'container does not exist' >&2\nexit 1\n"), 0755))
+			require.NoError(t, os.Chmod(binary, 0755))
+			require.NoError(t, handler.Delete(context.Background(), id))
+			assert.Positive(t, unmounts)
+			assert.NoDirExists(t, statePath)
+			assert.NoDirExists(t, filepath.Join(handler.storageRoot, id))
+			for _, path := range files {
+				assert.NoFileExists(t, path)
+			}
+		})
+	}
+}
+
+func TestRuncWaitStoppedDoesNotTreatMissingBinaryAsStopped(t *testing.T) {
+	handler := &Handler{client: NewClient(filepath.Join(t.TempDir(), "missing-runc"), t.TempDir())}
+	stopped, err := handler.waitStopped(context.Background(), "sbox-test", time.Second)
+	assert.False(t, stopped)
+	assert.True(t, errors.Is(err, syscall.ENOENT))
+}
+
+func TestRuncOrphanReconciliationRetainsStorageOnRuntimeFailure(t *testing.T) {
+	const id = "sbox-orphan-retry"
+	binary := filepath.Join(t.TempDir(), "missing-runc")
+	handler := &Handler{
+		sandboxRoot: t.TempDir(), storageRoot: t.TempDir(),
+		client: NewClient(binary, t.TempDir()),
+	}
+	storage := filepath.Join(handler.storageRoot, id)
+	require.NoError(t, os.Mkdir(storage, 0700))
+	retained := filepath.Join(storage, "retained")
+	require.NoError(t, os.WriteFile(retained, []byte("owned data"), 0600))
+	unmounts := 0
+	originalUnmount := unmountRuncPath
+	t.Cleanup(func() { unmountRuncPath = originalUnmount })
+	unmountRuncPath = func(string) error { unmounts++; return nil }
+
+	require.ErrorIs(t, handler.reconcileOrphans(), syscall.ENOENT)
+	assert.Zero(t, unmounts)
+	assert.FileExists(t, retained)
+
+	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'container does not exist' >&2\nexit 1\n"), 0755))
+	require.NoError(t, handler.reconcileOrphans())
+	assert.NoDirExists(t, storage)
 }

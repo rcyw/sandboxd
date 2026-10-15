@@ -321,14 +321,17 @@ func (r *Handler) Delete(ctx context.Context, sandboxID string) error {
 		config.StopTimeout+5*time.Second,
 	)
 	defer cancel()
-	stopErr := r.stopContainer(cleanupCtx, sandboxID)
+	if err := r.stopContainer(cleanupCtx, sandboxID); err != nil {
+		// A failed runtime command does not establish that its processes have
+		// stopped using these mounts and private storage. Retain them for retry.
+		return err
+	}
 	bundlePath, pathErr := util.JoinWithinRoot(r.sandboxRoot, sandboxID)
 	if pathErr != nil {
-		return errors.Join(stopErr, pathErr)
+		return pathErr
 	}
 	r.stopShim(bundlePath)
 	return errors.Join(
-		stopErr,
 		cleanupRuncRootfs(bundlePath),
 		cleanupRuncMounts(bundlePath),
 		cleanupRuncStorage(r.storageRoot, sandboxID),
@@ -352,7 +355,7 @@ func (r *Handler) stopContainer(ctx context.Context, sandboxID string) error {
 			_, _ = r.waitStopped(ctx, sandboxID, 2*time.Second)
 		}
 	}
-	return IgnoreMissing(r.client.Delete(ctx, sandboxID, true))
+	return r.client.Delete(ctx, sandboxID, true)
 }
 
 func (r *Handler) waitStopped(ctx context.Context, sandboxID string, timeout time.Duration) (bool, error) {
@@ -595,7 +598,7 @@ func (r *Handler) reconcileOrphans() error {
 		}
 		logrus.Warnf("runc: cleaning orphaned sandbox %s without metadata", sandboxID)
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), config.StopTimeout)
-		deleteErr := IgnoreMissing(r.client.Delete(cleanupCtx, sandboxID, true))
+		deleteErr := r.client.Delete(cleanupCtx, sandboxID, true)
 		cancel()
 		if deleteErr != nil {
 			return fmt.Errorf("delete orphaned runc sandbox %s: %w", sandboxID, deleteErr)

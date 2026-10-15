@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,10 +67,83 @@ func TestClientIncludesRuntimeFailureDetail(t *testing.T) {
 }
 
 func TestRuncErrorClassification(t *testing.T) {
-	assert.True(t, IsNotFound(errors.New("container does not exist")))
-	assert.True(t, IsNotRunning(errors.New("container is stopped")))
-	assert.NoError(t, IgnoreMissing(errors.New("not found")))
+	assert.False(t, IsNotFound(errors.New("container does not exist")))
+	assert.False(t, IsNotRunning(errors.New("container is stopped")))
+	assert.Error(t, IgnoreMissing(errors.New("not found")))
 	assert.Error(t, IgnoreMissing(assert.AnError))
+}
+
+func TestClientClassifiesRuntimeContainerErrors(t *testing.T) {
+	for _, test := range []struct {
+		message  string
+		missing  bool
+		inactive bool
+	}{
+		{"container does not exist", true, true},
+		{`time="2026-10-15T00:00:00Z" level=error msg="container does not exist"`, true, true},
+		{"container not running", false, true},
+		{"container is not running", false, true},
+		{"container is stopped", false, true},
+		{"open /private/state.json: no such file or directory", false, false},
+		{"helper binary not found", false, false},
+	} {
+		t.Run(test.message, func(t *testing.T) {
+			binary := filepath.Join(t.TempDir(), "runc")
+			script := "#!/bin/sh\ncat >&2 <<'RUNC_DIAGNOSTIC'\n" + test.message + "\nRUNC_DIAGNOSTIC\nexit 1\n"
+			require.NoError(t, os.WriteFile(binary, []byte(script), 0755))
+			_, err := NewClient(binary, t.TempDir()).State(context.Background(), "sbox-test")
+			require.Error(t, err)
+			assert.Equal(t, test.missing, IsNotFound(err))
+			assert.Equal(t, test.inactive, IsNotRunning(err))
+		})
+	}
+}
+
+func TestClientLaunchFailuresAreNotContainerAbsence(t *testing.T) {
+	for _, executable := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing", true: "permission-denied"}[executable], func(t *testing.T) {
+			binary := filepath.Join(t.TempDir(), "runc")
+			if executable {
+				require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0600))
+			}
+			client := NewClient(binary, t.TempDir())
+			_, stateErr := client.State(context.Background(), "sbox-test")
+			for _, err := range []error{stateErr, client.Delete(context.Background(), "sbox-test", true)} {
+				require.Error(t, err)
+				assert.False(t, IsNotFound(err))
+				assert.False(t, IsNotRunning(err))
+				assert.Error(t, IgnoreMissing(err))
+			}
+		})
+	}
+}
+
+func TestClientCancellationPreservesRuntimeDiagnosticWithoutConfirmingAbsence(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(t.TempDir(), "runc")
+	script := "#!/bin/sh\necho 'container does not exist' >&2\nprintf ready > \"$2/ready\"\nexec /bin/sleep 30\n"
+	require.NoError(t, os.WriteFile(binary, []byte(script), 0755))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewClient(binary, root).State(ctx, "sbox-test")
+		done <- err
+	}()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(root, "ready"))
+		return err == nil
+	}, 5*time.Second, time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+		assert.ErrorContains(t, err, "container does not exist")
+		assert.False(t, IsNotFound(err))
+		assert.False(t, IsNotRunning(err))
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime command did not stop after cancellation")
+	}
 }
 
 func missingContainerClient(t *testing.T, root string) *Client {

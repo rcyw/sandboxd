@@ -31,6 +31,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
+	"github.com/inclusionAI/sandboxd/pkg/runtime/runc"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
@@ -650,6 +651,50 @@ func TestDeleteTimeoutRetainsMetadataAndAllowsRetry(t *testing.T) {
 	_, err = s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
 	assert.NoError(t, err)
 	assert.Equal(t, int32(2), handler.calls.Load(), "retry must not join a permanently stuck singleflight")
+}
+
+type runcClientDeleteHandler struct {
+	*svc.FakeRuntimeHandler
+	client *runc.Client
+}
+
+func (h *runcClientDeleteHandler) Delete(ctx context.Context, id string) error {
+	return h.client.Delete(ctx, id, true)
+}
+
+func TestDeleteRuncLaunchFailureRetainsMetadataAndFilesystemForRetry(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "runc")
+	handler := &runcClientDeleteHandler{
+		FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+		client:             runc.NewClient(binary, t.TempDir()),
+	}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunc: handler})
+	const id = "sbox-runc-delete-retry"
+	bundle := filepath.Join(s.config.RootDir, "containers", id)
+	assert.NoError(t, os.MkdirAll(bundle, 0700))
+	assert.NoError(t, os.WriteFile(filepath.Join(bundle, config.SandboxSpecFile), []byte(`{"ociVersion":"1.0.2","process":{"cwd":"/"},"root":{"path":"rootfs"},"linux":{},"annotations":{}}`), 0600))
+	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{ID: id, RuntimeHandler: config.RuntimeNameRunc}))
+	s.fsMgr.sandboxState[id] = sandboxFSState{Rootfs: []byte("retained rootfs lease")}
+
+	_, err := s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
+	assert.Error(t, err)
+	_, err = s.sandboxManager.Get(id)
+	assert.NoError(t, err, "failed runtime deletion must retain sandbox ownership")
+	s.fsMgr.mu.Lock()
+	_, retained := s.fsMgr.sandboxState[id]
+	s.fsMgr.mu.Unlock()
+	assert.True(t, retained, "failed runtime deletion must retain the filesystem lease")
+	assert.DirExists(t, bundle)
+
+	assert.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'container does not exist' >&2\nexit 1\n"), 0755))
+	_, err = s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
+	assert.NoError(t, err)
+	_, err = s.sandboxManager.Get(id)
+	assert.Error(t, err)
+	s.fsMgr.mu.Lock()
+	_, retained = s.fsMgr.sandboxState[id]
+	s.fsMgr.mu.Unlock()
+	assert.False(t, retained)
 }
 
 type timeoutThenDeleteHandler struct {
