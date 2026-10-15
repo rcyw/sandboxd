@@ -408,6 +408,8 @@ Sandboxd uses the Linux boot ID to distinguish a host reboot from a service rest
 
 During the same boot, persisted leases remain authoritative and active TAP recovery continues to fail if a device is missing or has been replaced. An unstamped legacy store is adopted without clearing its leases. Unreadable boot identity, invalid persisted identity, or an unreadable lease database fails startup rather than deleting authoritative sandbox state.
 
+If a crash leaves a runsc record without readable sandbox metadata, startup recovery deletes it through runsc only when it explicitly reports stopped and has no positive process ID. Tracked records and live, created, or unknown states are preserved. Runtime inspection or deletion failure prevents admission so incomplete cleanup is not reported as successful. This does not delete caller-owned checkpoint inputs or recover their contents.
+
 ## Writable block I/O policy
 
 New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cache_type = "Writeback"` in `plugin.runtime.firecracker`. The pinned Firecracker runtime bundle includes direct-I/O alignment support. Operators using an older VMM must explicitly select `Async` or `Sync`. The writable policy applies to the private ext4 disk, including native writable mounts. It does not change EROFS root disks, virtio-fs exports, or checkpoint memory-file I/O.
