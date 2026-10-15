@@ -410,6 +410,8 @@ During the same boot, persisted leases remain authoritative and active TAP recov
 
 If a crash leaves a runsc record without readable sandbox metadata, startup recovery deletes it through runsc only when it explicitly reports stopped and has no positive process ID. Tracked records and live, created, or unknown states are preserved. Runtime inspection or deletion failure prevents admission so incomplete cleanup is not reported as successful. This does not delete caller-owned checkpoint inputs or recover their contents.
 
+When runsc confirms a tracked instance is stopped without a positive PID, ACL recovery retires its stale binding instead of requiring the previous kernel's TAP. Its sandbox metadata is retained for the normal runtime, filesystem, and resource deletion path. Live, absent, or ambiguous runtime state keeps strict active endpoint recovery; failure to inspect the runtime prevents startup. This check uses current runtime state on every startup, so it also works after an earlier initialization attempt failed after advancing the boot stamp.
+
 ## Writable block I/O policy
 
 New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cache_type = "Writeback"` in `plugin.runtime.firecracker`. The pinned Firecracker runtime bundle includes direct-I/O alignment support. Operators using an older VMM must explicitly select `Async` or `Sync`. The writable policy applies to the private ext4 disk, including native writable mounts. It does not change EROFS root disks, virtio-fs exports, or checkpoint memory-file I/O.

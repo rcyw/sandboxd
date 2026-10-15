@@ -90,6 +90,8 @@ Sandboxd records the Linux boot ID alongside its metadata. A service restart in 
 
 Before accepting RPCs, startup recovery also asks runsc to delete untracked records that explicitly report stopped with no positive process ID. This covers crashes that leave runtime state but no readable sandbox metadata. It uses the runtime's deletion boundary, preserves tracked records and live or ambiguous states, and fails startup on runtime inspection or cleanup errors. Other runtime adapters are unchanged.
 
+Network ACL recovery also checks current runsc state. A tracked instance confirmed stopped without a positive PID no longer needs its old TAP binding restored; its metadata remains available for normal deletion. Persisted Running status alone is insufficient after a reboot. Live, missing, and ambiguous runtime states retain strict endpoint recovery, and an inspection error fails startup.
+
 An optional per-sandbox ACL uses native netfilter and ipset with the `iptables`
 backend and TC eBPF with the `bpfnat` backend. Both support prioritized
 stateful IPv4 CIDR, domain, protocol, and port rules, fragments, and managed
