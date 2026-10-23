@@ -51,6 +51,37 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
+## Runsc filestore checkpoints
+
+Runsc normally serializes application memory and writable-layer pages into its checkpoint files. Set the node-owned `[plugin.runtime.runsc] checkpoint_mode = "reflink"` to capture writable filestores with the matching gVisor bundle's `FICLONE` support instead. An unset mode or `"full"` preserves page serialization; unknown modes fail runtime initialization. This setting does not change the meaning of `snapshot_type`, which runsc ignores, or enable dirty-page incremental application-memory checkpoints.
+
+Reflink mode passes `--skip-filestore-pages` and `--filestore-snapshot-dir=<checkpoint_dir>/filestores`. Runsc clones the backing files inside its freeze window, including for `leave_running=true`, and commits a `filestores/filestores.json` manifest. Keep this entire directory together with `checkpoint.img` and any split page files. Each checkpoint requires its own fresh directory. The live filestores and the checkpoint destination must be on the same reflink-capable filesystem, such as XFS with reflink enabled. Cross-device clones and unsupported filesystems fail; sandboxd does not silently fall back after beginning a reflink checkpoint.
+
+Fresh sandboxes in reflink mode also receive `--filestore-parent-mountns=true`, so anonymous backing files and later checkpoint destinations reference the same launcher mount. This avoids older kernels' `EXDEV` rejection of reflinks between namespace copies of the same filesystem. The matching runtime bundle must provide this option. It pins the backing mount while the sandbox holds its filestore descriptors, so drain sandboxes before unmounting or replacing the node's filestore. An already running sandbox created in full mode keeps its original backing descriptors; recreate it before enabling reflink mode.
+
+Restore detects this artifact layout independently of the current save mode. Before the existing Restore control RPC, sandboxd passes the artifact directory and `--filestore-clone-on-adopt=true` to `runsc create`. Each target adopts a private, immediately unlinked CoW copy; it never consumes or mutates the saved filestores. The caller can reuse the checkpoint. Restored filestores use private copies after restoration, but checkpoint memory-image and split-page files must remain available while background page loading can access them. Runsc verifies mount identities, sizes and sampled fingerprints. Sandboxd rejects partial manifests, symlinks and artifact names that escape the checkpoint directory. Checkpoints without the filestores directory retain the legacy restore path.
+
+Sharing applies to writable-file extents, not the independently saved application-memory pages. Logical file lengths and ordinary summed `du` output do not measure unique physical storage when extents are shared. Measure filesystem usage and shared extents, including unlinked live filestores, when evaluating savings. Host directory bind contents remain caller-owned and are not captured or rolled back by this mechanism. Only anonymous disk-backed filestores are supported; self-overlay backing must not be used for these snapshots. Private tmpfs filestores require the matching gVisor anonymous-filestore mount hints.
+
+Save and restore must use matching runtime builds. Drain sandboxes before replacing the runtime bundle; do not assume old saved state remains compatible across a gVisor upgrade. Install the complete checksum-pinned gVisor archive with its matching helpers, rather than replacing runsc alone.
+
+## Checkpoint output synchronization
+
+`plugin.runtime.checkpoint_sync.sync_output` defaults to `false`, preserving the existing page-cache completion contract. Set it to `true` when successful checkpoint publication must include the backing filesystem's synchronization guarantee:
+
+```toml
+[plugin.runtime.checkpoint_sync]
+sync_output = true
+```
+
+The server synchronizes every regular file and directory, including the capture root's parent directory entry, after the runtime finishes capture and before acknowledging the Checkpoint RPC. In runsc reflink mode this includes the cloned files and manifest under `filestores/`. Symlinks and special files are rejected. A synchronization failure fails the RPC and cleans partial output without deleting the source sandbox; it does not roll back the runtime's checkpoint operation, so callers must reconcile source state. The request deadline and cancellation are checked between filesystem operations; an in-flight operating-system `fsync` cannot be interrupted. This option relies on the configured filesystem's persistence contract and does not configure storage replication.
+
+## runsc background restore
+
+`plugin.runtime.runsc.background_restore` defaults to `false`. Setting it to `true` forwards runsc's background page-loading option through the Restore RPC. Restore can then return before the entire memory image has been loaded. Callers must retain immutable checkpoint inputs while the runtime can still access them and measure full memory availability separately from RPC completion. This setting does not change checkpoint publication or output synchronization. It is independent of `checkpoint_mode`: full and reflink checkpoints both support this option. Private restored filestore copies do not release the memory-image and split-page inputs needed by background loading.
+
+The following Firecracker performance and durability descriptions assume the default `sync_output=false` profile. With synchronization enabled, the server adds its barrier after the runtime completes its capture, outside the runtime's guest pause window.
+
 ## Firecracker artifacts and incremental checkpoints
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout
@@ -167,7 +198,7 @@ artifact; checkpoint success is reported only after the manifest is published.
   requires the restore-established pagemap base and fails otherwise. An
   explicit `SoftDirty` requires a usable base.
 
-Runtimes without incremental checkpoints (runsc) ignore the field.
+Runsc ignores this field; its optional filestore reflink mode is selected by node configuration instead.
 
 Lineage-loss rules: the VMM keeps its soft-dirty ledger in process memory, and
 an armed ledger writes only the window delta regardless of which base sandboxd
@@ -206,6 +237,23 @@ computed once per sandboxd process. A restore compares the tuple against its
 own stack and refuses on a mismatch, naming the conflicting field. Manifests
 without a tuple (artifacts from before the tuple existed) restore without stack
 verification.
+
+#### KVM backend identity
+
+The `compat` tuple records the probed `backend` (`"pvm"` or `"kvm"`) and, on x86-64, `tsc_frequency_khz`. At daemon startup, `KVM_GET_MSR_INDEX_LIST` on the system-wide `/dev/kvm` fd distinguishes PVM using `MSR_PVM_VCPU_STRUCT` (0x4b564df1). A failed x86 backend probe prevents registration. The `firecracker` runtime requires hardware KVM, while the opt-in `firecracker-pvm` runtime requires PVM and reads `[plugin.runtime.firecracker_pvm]`. PVM is rejected on non-x86 builds; hardware KVM preserves its non-x86 behavior without using x86 MSR or TSC ioctls.
+
+Cross-backend restores fail before starting the VMM. PVM vmstate carries backend-specific event-delivery MSRs that hardware KVM rejects at `KVM_SET_MSRS`; hardware-KVM state lacks those PVM MSRs. The gate reports an incompatibility instead of exposing a late partial MSR write failure. Daemon recovery also checks each bundle's `runtime.json`: a handler adopts only its runtime variant, and only the hardware-KVM handler retains support for legacy bundles without a marker.
+
+Legacy checkpoint artifacts without a backend tag, including v1 archives without a manifest or a v2 manifest without `compat`, follow an asymmetric policy:
+
+- Hardware-KVM nodes retain legacy restore behavior. Operators must confirm provenance: old experimental PVM checkpoints are also untagged and can still fail on hardware KVM.
+- PVM nodes refuse artifacts whose backend cannot be verified. Produce a new checkpoint using the PVM runtime instead of relabeling an old manifest.
+
+The tested PVM backend reports `KVM_CAP_TSC_CONTROL=0`. Registering PVM requires successful capability and non-zero frequency probes; restoring on PVM requires a recorded non-zero frequency equal to the target's frequency. Unknown or different frequencies fail compatibility verification before starting the VMM. Hardware KVM retains legacy handling for missing frequencies and lets Firecracker apply supported scaling. These checks do not establish heterogeneous CPU migration support; qualify CPU compatibility separately and use the identical VMM, kernel, initrd and virtiofsd stack as the baseline.
+
+The opt-in strict-TSC guest candidate improves kernel clock and timer recovery when a same-frequency PVM TSC offset changes, but it does not preserve raw RDTSC/RDTSCP continuity or provide TSC scaling. Continue to validate the entire compatibility tuple. A different guest digest or `pvm_tsc` kernel argument is incompatible with an existing checkpoint; retain the original stack or recreate workloads. PVM bundles built from the older guest source remain limited to the same host/L1 boot and TSC domain until a separately qualified strict-TSC PVM bundle is selected.
+
+Fresh Firecracker starts share a 15-second deadline across VMM API readiness, VM configuration, guest-agent health checks and guest configuration. Startup logs report these phases separately. If the VMM exits during a fresh start or restore, sandboxd cancels readiness and configuration I/O and reports the VMM exit status without waiting for the agent deadline. A failed health check preserves the attempt count and last connection or protocol error; a boot failure also records the available regular-file console tails before cleanup. Empty output paths still discard the console, so configure per-VM stdout and stderr files when collecting boot evidence. An expired or canceled context always fails an unsent guest-agent request, including the interval before the context timer publishes its deadline error.
 
 ### Storage layout for high-performance Firecracker checkpoints
 
@@ -344,6 +392,8 @@ After a successful checkpoint with `leave_running=false`, the caller still
 deletes the source through the normal sandbox API to release its metadata and
 resources.
 
+On cgroup-v1 hosts, source deletion removes each physical controller hierarchy once, including when controllers such as `net_cls` and `net_prio` share a mount. Already removed controller paths are skipped on retry, while the cgroup library still rejects removal of groups containing live processes. This prevents partial controller cleanup from leaving stale memory-controller entries that break later daemon recovery when their `pids.max` is absent.
+
 On failure, sandboxd returns an error and does not force-delete, stop, or
 resume the source. The caller decides how to handle the source sandbox.
 sandboxd only cleans partial checkpoint output: it removes a leaf directory it
@@ -419,3 +469,9 @@ New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cach
 The VMM persists the engine and cache policy in device state and reopens the writable disk with the saved policy on restore. Changing sandboxd's defaults affects newly created VMs; it does not override the policy captured in an existing checkpoint. Checkpoint compatibility still requires matching runtime digests. Direct-I/O alignment requirements are queried again for the restored image on its destination filesystem. Request-owned alignment buffers and in-flight I/O are completed before snapshotting; completed reads reach guest memory and dirty tracking before the device state is saved. Alignment buffers are not separate checkpoint artifacts.
 
 The destination host must support the saved I/O engine. In particular, direct engines require the destination kernel and backing filesystem to report `STATX_DIOALIGN`, normally available for ext4 and XFS on upstream Linux 6.1 or newer; asynchronous engines also require usable `io_uring`. Restore fails when those capabilities are unavailable and never automatically changes the saved engine to buffered I/O. Operators using hosts without Direct I/O alignment-query support must explicitly configure `Async` or `Sync` before creating new sandboxes; this setting cannot make an existing Direct I/O checkpoint compatible with such a host. See [host I/O compatibility and configuration](runtime.md) for details.
+
+#### Checkpoint timing diagnostics
+
+The Firecracker completion log keeps `layout`, `flush`, `pause`, `snapshot`, `overlay`, `resume`, `seal` and `total` timings, and splits the `seal` interval into `manifest`, `adopt`, `persist` and `writeback_queue`. The debug log separates manifest component hashing from publication, native snapshot time from both cgroup moves, and atomic state-file creation, writing, `fsync`, closing and rename. `seal` includes instance-state persistence and queue submission; it is not a measurement of guest-memory hashing or an assurance that all checkpoint data reached stable storage. Collect these timings alongside I/O and CPU-pressure measurements before attributing nested checkpoint latency to the virtualization backend.
+
+When profiling nested PVM, keep the VMM and its vCPU threads outside ptrace. Following sandboxd forks can otherwise perturb guest startup even with a narrow displayed syscall filter. For example, `strace -f -b execve` follows sandboxd threads but detaches children when they execute another program; verify the running Firecracker process reports `TracerPid: 0`. Record outer block-I/O limits as well as CPU/memory limits. Separate virtual disks or ext4/XFS filesystems can still share one capped backing device. Memory-backed checkpoint controls are diagnostics and do not replace persistent-storage or restore qualification.

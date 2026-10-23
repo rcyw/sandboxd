@@ -93,6 +93,9 @@ type RuntimeConfig struct {
 	// Runsc configures the gVisor runtime adapter.
 	Runsc RunscConfig `toml:"runsc" json:"runsc"`
 
+	// CheckpointSync optionally synchronizes completed checkpoint output.
+	CheckpointSync CheckpointSyncConfig `toml:"checkpoint_sync" json:"checkpointSync"`
+
 	// Kata configures the optional Kata Containers runtime adapter. Kata is
 	// loaded only when runtime_binary contains a "kata" entry.
 	Kata KataConfig `toml:"kata" json:"kata"`
@@ -104,6 +107,15 @@ type RuntimeConfig struct {
 	// Firecracker configures the optional microVM runtime adapter. It is loaded
 	// only when runtime_binary contains a "firecracker" entry.
 	Firecracker FirecrackerConfig `toml:"firecracker" json:"firecracker"`
+
+	// FirecrackerPVM configures the optional Firecracker microVM runtime for
+	// the kvm-pvm backend. It shares the FirecrackerConfig structure because
+	// the VMM binary and device model are identical; the section exists so a
+	// PVM node can pin different guest boot artifacts (PVM guest kernel and
+	// initrd) without affecting hardware-KVM nodes. It is loaded only when
+	// runtime_binary contains a "firecracker-pvm" entry, and the handler
+	// refuses to start unless the kvm-pvm module is behind /dev/kvm.
+	FirecrackerPVM FirecrackerConfig `toml:"firecracker_pvm" json:"firecrackerPVM"`
 
 	// BasicSpec is the basic spec file for different runtime type.
 	BasicSpec map[string]string `toml:"basic_spec" json:"basicSpec"`
@@ -145,6 +157,20 @@ type RunscConfig struct {
 	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
 	// an explicitly empty list disables that default.
 	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
+	// CheckpointMode selects full page serialization (the default) or reflink
+	// snapshots of writable filestores. Reflink requires a matching runsc bundle
+	// and a shared reflink-capable filesystem for live and saved filestores.
+	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// BackgroundRestore lets runsc load remaining memory pages after restore
+	// returns. False preserves synchronous loading.
+	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`
+}
+
+// CheckpointSyncConfig controls the final filesystem persistence barrier.
+type CheckpointSyncConfig struct {
+	// SyncOutput fsyncs regular files and directories before acknowledging a
+	// completed checkpoint. False preserves the existing page-cache contract.
+	SyncOutput bool `toml:"sync_output" json:"syncOutput"`
 }
 
 // KataConfig contains the host paths and storage settings used by Kata.
@@ -256,6 +282,18 @@ func NormalizeRunscPlatform(value string) (string, error) {
 			RunscPlatformKVM,
 			value,
 		)
+	}
+}
+
+// NormalizeRunscCheckpointMode validates the node-owned checkpoint policy.
+func NormalizeRunscCheckpointMode(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "full":
+		return "full", nil
+	case "reflink":
+		return "reflink", nil
+	default:
+		return "", fmt.Errorf("runsc checkpoint_mode must be full or reflink, got %q", value)
 	}
 }
 

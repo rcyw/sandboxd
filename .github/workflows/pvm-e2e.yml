@@ -1,0 +1,136 @@
+name: PVM isolated L1 E2E
+"on":
+  # Register the entry point when it lands on the maintained branch. Only an
+  # explicit maintainer dispatch assigns a disposable privileged runner.
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Empty selects the dispatch SHA; otherwise main or refs/pull/N/head'
+        required: false
+        default: ''
+        type: string
+      host_profile_ref:
+        description: 'AKernel develop or refs/pull/N/head containing the expected host profile'
+        required: true
+        default: develop
+        type: string
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: pvm-isolated-l1
+  cancel-in-progress: false
+jobs:
+  request:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      profile_repository: ${{ steps.resolve.outputs.profile_repository }}
+      profile_sha: ${{ steps.resolve.outputs.profile_sha }}
+      profile_digest: ${{ steps.resolve.outputs.profile_digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Resolve allowed refs to immutable qualification inputs
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PVM_SOURCE_REF: ${{ inputs.source_ref }}
+          PVM_HOST_PROFILE_REF: ${{ inputs.host_profile_ref }}
+        run: python3 test/e2e/pvm-request.py --kind runtime
+  pvm:
+    needs: request
+    runs-on: [self-hosted, linux, x64, pvm-l1-ubuntu7]
+    timeout-minutes: 180
+    env:
+      DOCKER_HOST: unix:///run/pvm-ci-docker.sock
+      PVM_SOURCE_SHA: ${{ needs.request.outputs.source_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.request.outputs.source_sha }}
+      - name: Check out caller-owned expected host profile
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ needs.request.outputs.profile_repository }}
+          ref: ${{ needs.request.outputs.profile_sha }}
+          path: .pvm-host-profile
+          persist-credentials: false
+          sparse-checkout: deploy/pvm/host-profile.json
+          sparse-checkout-cone-mode: false
+      - name: Bind expected profile to the resolved consumer commit
+        env:
+          EXPECTED_DIGEST: ${{ needs.request.outputs.profile_digest }}
+        run: |
+          set -euo pipefail
+          export PVM_HOST_PROFILE="${RUNNER_TEMP}/pvm-host-profile.json"
+          printf 'PVM_HOST_PROFILE=%s\n' "${PVM_HOST_PROFILE}" >> "${GITHUB_ENV}"
+          cp .pvm-host-profile/deploy/pvm/host-profile.json "${PVM_HOST_PROFILE}"
+          printf '%s  %s\n' "${EXPECTED_DIGEST}" "${PVM_HOST_PROFILE}" | sha256sum -c -
+          rm -rf .pvm-host-profile
+      - name: Verify disposable L1 boundary
+        run: |
+          echo "PVM_CI_OUTPUT=${RUNNER_TEMP}/pvm-ci" >>"${GITHUB_ENV}"
+          python3 test/e2e/pvm-l1.py
+      - name: Install L1 build and runtime prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y build-essential pkg-config libseccomp-dev \
+            iproute2 iptables erofs-utils xfsprogs fuse3 e2fsprogs \
+            clang llvm jq cpio curl git
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run real PVM runtime cases
+        run: bash test/e2e/pvm-ci.sh
+      - name: Clean owned PVM test containers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py --boundary-only
+          for runtime in firecracker-pvm firecracker-pvm-incremental firecracker-pvm-virtiofs; do
+            for suffix in "" -no-cgroup; do
+              name="pvm-ci-${GITHUB_RUN_ID}-${runtime}${suffix}"
+              if docker inspect "${name}" >/dev/null 2>&1; then
+                test "$(docker inspect --format '{{.Config.Image}}' "${name}")" = "sandboxd-runtime-e2e:${runtime}"
+                docker rm -f "${name}"
+              fi
+            done
+          done
+      - name: Collect bounded qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pvm-runtime-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/pvm-ci
+          retention-days: 30
+          if-no-files-found: error
+      - name: Unload owned L1 PVM modules
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py --boundary-only
+          [[ -f "${PVM_CI_OUTPUT}/module-load-intent.json" ]] || exit 0
+          python3 - <<'OWNED_MODULES'
+          import json,os
+          from pathlib import Path
+          intent=json.loads((Path(os.environ['PVM_CI_OUTPUT'])/'module-load-intent.json').read_text())
+          marker=json.loads(Path('/etc/akernel-pvm-ci.json').read_text())
+          assert intent['lab_id']==marker['lab_id']
+          OWNED_MODULES
+          if [[ -d /sys/module/kvm_pvm ]]; then rmmod kvm_pvm; fi
+          if [[ -d /sys/module/kvm ]]; then rmmod kvm; fi
